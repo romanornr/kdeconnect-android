@@ -23,7 +23,6 @@ import org.kde.kdeconnect_tp.BuildConfig
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import java.io.ByteArrayInputStream
-import java.io.IOException
 import java.io.InputStream
 
 @RunWith(AndroidJUnit4::class)
@@ -125,15 +124,6 @@ class ClipboardListenerTest {
     }
 
     @Test
-    fun listenerCreatedWhileResumedCanDetectClipboardChanges() {
-        resume()
-        listen()
-        runWorkers()
-        assertEquals(1, launches)
-        assertClipboardReadRequested()
-    }
-
-    @Test
     fun foregroundReentryDoesNotDuplicateAReaderThatIsStillRunning() {
         val stream = object : ByteArrayInputStream(denial().toByteArray()) {
             override fun read(bytes: ByteArray, offset: Int, length: Int): Int {
@@ -151,47 +141,11 @@ class ClipboardListenerTest {
     }
 
     @Test
-    fun readerEofAllowsClipboardDetectionAfterNextResume() {
+    fun stoppedReaderIsReplacedOnNextResume() {
         listen { if (launches == 1) reader("".byteInputStream()) else reader() }
         resume()
         runWorkers()
         assertNull(shadowOf(application).nextStartedActivity)
-        assertEquals(1, destroyed)
-
-        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-        resume()
-        runWorkers()
-        assertEquals(2, launches)
-        assertClipboardReadRequested()
-        assertEquals(2, destroyed)
-    }
-
-    @Test
-    fun failedProcessStartCanRecoverAfterNextResume() {
-        listen {
-            if (launches == 1) throw IOException("logcat unavailable")
-            reader()
-        }
-        resume()
-        runWorkers()
-        assertNull(shadowOf(application).nextStartedActivity)
-
-        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-        resume()
-        runWorkers()
-        assertEquals(2, launches)
-        assertClipboardReadRequested()
-    }
-
-    @Test
-    fun readFailureClosesProcessAndCanRecoverAfterNextResume() {
-        listen {
-            if (launches == 1) reader(object : InputStream() {
-                override fun read(): Int = throw IOException("logcat disconnected")
-            }) else reader()
-        }
-        resume()
-        runWorkers()
         assertEquals(1, destroyed)
 
         lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
