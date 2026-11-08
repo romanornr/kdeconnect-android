@@ -25,6 +25,7 @@ Automatic background clipboard access requires the [log-reading workaround](http
 On Android 13 and later, granting `READ_LOGS` alone is not enough: Android also requires consent for system-log access while the app is in the foreground.
 Open KDE Connect and approve Android's log-access prompt if shown. The clipboard log reader stays running when you leave the app.
 If the reader stops, reopening KDE Connect lets it start again without force-stopping the app.
+After the app restarts in the background, the log-access prompt appears on its own the next time you unlock the phone.
 
 ## Contributing
 

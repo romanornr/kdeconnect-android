@@ -40,6 +40,12 @@ class ClipboardFloatingActivity : AppCompatActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
+            if (intent.getBooleanExtra(KEY_REQUEST_LOG_ACCESS, false)) {
+                ClipboardListener.instance(this).startLogReader()
+                // Stay the top app until logd has asked Android whether to show the consent dialog.
+                window.decorView.postDelayed({ finish() }, 1000)
+                return
+            }
             // We are now sure that clipboard can be accessed from here.
             ClipboardListener.instance(this).onClipboardChanged()
             if (shouldShowToast()) {
@@ -66,12 +72,17 @@ class ClipboardFloatingActivity : AppCompatActivity() {
 
     companion object {
         private const val KEY_SHOW_TOAST = "SHOW_TOAST"
+        const val KEY_REQUEST_LOG_ACCESS = "REQUEST_LOG_ACCESS"
 
         fun getIntent(context: Context, showToast: Boolean): Intent {
             return Intent(context.applicationContext, ClipboardFloatingActivity::class.java).apply {
                 putExtra(KEY_SHOW_TOAST, showToast)
                 flags = Intent.FLAG_ACTIVITY_CLEAR_TASK or Intent.FLAG_ACTIVITY_NEW_TASK
             }
+        }
+
+        fun getLogAccessIntent(context: Context): Intent {
+            return getIntent(context, false).putExtra(KEY_REQUEST_LOG_ACCESS, true)
         }
     }
 }
