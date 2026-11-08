@@ -6,10 +6,14 @@
  */
 package org.kde.kdeconnect.plugins.clipboard
 
+import android.app.ActivityManager
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -32,6 +36,7 @@ class ClipboardListener internal constructor(
     ctx: Context,
     private val lifecycle: Lifecycle = ProcessLifecycleOwner.get().lifecycle,
     private val startProcess: (Array<String>) -> Process = { Runtime.getRuntime().exec(it) },
+    private val isTopApp: () -> Boolean = ::processIsTopApp,
 ) {
     enum class ClipboardContentType {
         Text,
@@ -55,36 +60,45 @@ class ClipboardListener internal constructor(
     private lateinit var cm: ClipboardManager
 
     private val logReaderRunning = AtomicBoolean(false)
-    private val isResumed = AtomicBoolean(false)
+    private val readerVerified = AtomicBoolean(false)
+    private val probePending = AtomicBoolean(false)
+    @Volatile
+    private var readerProcess: Process? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     init {
-        Handler(Looper.getMainLooper()).post {
+        mainHandler.post {
             cm = context.getSystemService<ClipboardManager>()!!
             cm.addPrimaryClipChangedListener { this.onClipboardChanged() }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                isResumed.set(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
                 lifecycle.addObserver(object : DefaultLifecycleObserver {
                     override fun onResume(owner: LifecycleOwner) {
-                        isResumed.set(true)
                         startLogReader()
                     }
 
                     override fun onPause(owner: LifecycleOwner) {
-                        isResumed.set(false)
+                        probeLogReader()
                     }
                 })
                 startLogReader()
             }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(object : BroadcastReceiver() {
+                    override fun onReceive(context: Context, intent: Intent) {
+                        requestLogAccessIfNeeded()
+                    }
+                }, IntentFilter(Intent.ACTION_USER_PRESENT))
+            }
         }
     }
 
-    private fun startLogReader() {
-        // Start logcat only while an activity is resumed. Since Android 13, logd asks the user for
-        // consent only when the app is the top app. Otherwise it denies silently but keeps the logcat
-        // process alive and blind to other UIDs, so clipboard sync stops until the process is killed.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            !isResumed.get()
-        ) {
+    private fun needsConsent() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+
+    fun startLogReader() {
+        // Start logcat only while the app is the top app. Since Android 13, logd asks the user for
+        // consent only in that state. Otherwise it denies silently but keeps the logcat process alive
+        // and blind to other UIDs, so clipboard sync stops until the process is killed.
+        if (needsConsent() && !isTopApp()) {
             return
         }
         if (!ClipboardPlugin.canSyncAutomatically(context) || !logReaderRunning.compareAndSet(false, true)) {
@@ -94,16 +108,23 @@ class ClipboardListener internal constructor(
             var process: Process? = null
             try {
                 // The app may have left the foreground since this was queued.
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !isResumed.get()) {
+                if (needsConsent() && !isTopApp()) {
                     return@runOnNewThread
                 }
                 val timeStamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
                 // Listen only ClipboardService errors after now
                 val logcatFilter = if (Build.VERSION.SDK_INT > Build.VERSION_CODES.VANILLA_ICE_CREAM) { "E ClipboardService" } else { "ClipboardService:E" }
                 process = startProcess(arrayOf("logcat", "-T", timeStamp, logcatFilter, "*:S"))
+                readerProcess = process
                 BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
                     reader.forEachLine { line ->
-                        if (line.contains(BuildConfig.APPLICATION_ID)) {
+                        if (!line.contains(BuildConfig.APPLICATION_ID)) {
+                            return@forEachLine
+                        }
+                        if (probePending.compareAndSet(true, false)) {
+                            // Our own probe read. The reader can see system logs.
+                            readerVerified.set(true)
+                        } else {
                             context.startActivity(ClipboardFloatingActivity.getIntent(context, false))
                         }
                     }
@@ -112,9 +133,39 @@ class ClipboardListener internal constructor(
             } catch (e: Exception) {
                 Log.w("ClipboardListener", "Clipboard log reader failed; will retry when the app resumes", e)
             } finally {
+                readerProcess = null
+                readerVerified.set(false)
+                probePending.set(false)
                 process?.destroy()
                 logReaderRunning.set(false)
             }
+        }
+    }
+
+    // A denied reader cannot be told apart from a working one by looking at the process. Reading the
+    // clipboard from the background makes Android log a denial for this package; a working reader
+    // sees that line within moments. If it does not arrive, the reader is blind and gets replaced.
+    private fun probeLogReader() {
+        if (!needsConsent() || !logReaderRunning.get() || readerVerified.get() || !probePending.compareAndSet(false, true)) {
+            return
+        }
+        try {
+            cm.primaryClip
+        } catch (_: Exception) {
+        }
+        mainHandler.postDelayed({
+            if (probePending.compareAndSet(true, false)) {
+                Log.w("ClipboardListener", "Clipboard log reader cannot see system logs; stopping it")
+                readerProcess?.destroy()
+            }
+        }, PROBE_TIMEOUT_MS)
+    }
+
+    // Shows Android's log access dialog without waiting for the user to open the app: our invisible
+    // activity makes the app the top app for a moment, which is all the consent check requires.
+    private fun requestLogAccessIfNeeded() {
+        if (needsConsent() && ClipboardPlugin.canSyncAutomatically(context) && !logReaderRunning.get()) {
+            context.startActivity(ClipboardFloatingActivity.getLogAccessIntent(context))
         }
     }
 
@@ -162,6 +213,15 @@ class ClipboardListener internal constructor(
 
     companion object {
         private var _instance: ClipboardListener? = null
+        private const val PROBE_TIMEOUT_MS = 2000L
+
+        // A resumed activity behind the lock screen counts as TOP_SLEEPING, not FOREGROUND, and
+        // Android refuses log access in that state without showing anything.
+        private fun processIsTopApp(): Boolean {
+            val info = ActivityManager.RunningAppProcessInfo()
+            ActivityManager.getMyMemoryState(info)
+            return info.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+        }
 
         fun instance(context: Context): ClipboardListener {
             // FIXME: The _instance we return won't be completely initialized yet since initialization happens on a new thread (why?)

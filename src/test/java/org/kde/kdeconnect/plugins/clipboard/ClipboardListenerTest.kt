@@ -2,6 +2,7 @@ package org.kde.kdeconnect.plugins.clipboard
 
 import android.Manifest
 import android.app.Application
+import android.content.Intent
 import android.os.Looper
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -15,6 +16,7 @@ import io.mockk.unmockkObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -22,8 +24,8 @@ import org.kde.kdeconnect.helpers.ThreadHelper
 import org.kde.kdeconnect_tp.BuildConfig
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
-import java.io.ByteArrayInputStream
 import java.io.InputStream
+import java.time.Duration
 
 @RunWith(AndroidJUnit4::class)
 @Config(application = Application::class, sdk = [33])
@@ -32,6 +34,7 @@ class ClipboardListenerTest {
     private lateinit var owner: LifecycleOwner
     private lateinit var lifecycle: LifecycleRegistry
     private val workers = ArrayDeque<Runnable>()
+    private var top = false
     private var launches = 0
     private var destroyed = 0
 
@@ -65,13 +68,25 @@ class ClipboardListenerTest {
 
     private fun denial() = "ClipboardService: Denying clipboard access to ${BuildConfig.APPLICATION_ID}\n"
 
-    private fun listen(start: () -> Process = { reader() }) {
-        ClipboardListener(application, lifecycle) {
-            launches++
-            start()
+    // Each step runs on one read call and returns the bytes to deliver, or null for end of stream.
+    private fun scripted(vararg steps: () -> ByteArray?): InputStream = object : InputStream() {
+        private val pending = ArrayDeque(steps.toList())
+
+        override fun read(): Int = throw UnsupportedOperationException()
+
+        override fun read(bytes: ByteArray, offset: Int, length: Int): Int {
+            val chunk = pending.removeFirstOrNull()?.invoke() ?: return -1
+            chunk.copyInto(bytes, offset)
+            return chunk.size
         }
-        shadowOf(Looper.getMainLooper()).idle()
     }
+
+    private fun listen(start: () -> Process = { reader() }) {
+        ClipboardListener(application, lifecycle, { launches++; start() }, { top })
+        idle()
+    }
+
+    private fun idle() = shadowOf(Looper.getMainLooper()).idle()
 
     private fun runWorkers() {
         // A broken ownership guard must fail here rather than enqueue work forever.
@@ -83,7 +98,13 @@ class ClipboardListenerTest {
     }
 
     private fun resume() {
+        top = true
         lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+    }
+
+    private fun pause() {
+        top = false
+        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
     }
 
     private fun assertClipboardReadRequested() {
@@ -109,10 +130,18 @@ class ClipboardListenerTest {
     }
 
     @Test
+    fun resumedBehindLockScreenDoesNotRequestLogAccess() {
+        listen()
+        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        runWorkers()
+        assertEquals(0, launches)
+    }
+
+    @Test
     fun queuedReaderDoesNotRequestLogAccessAfterAppLeavesForeground() {
         listen()
         resume()
-        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        pause()
         lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
         runWorkers()
         assertEquals(0, launches)
@@ -125,14 +154,12 @@ class ClipboardListenerTest {
 
     @Test
     fun foregroundReentryDoesNotDuplicateAReaderThatIsStillRunning() {
-        val stream = object : ByteArrayInputStream(denial().toByteArray()) {
-            override fun read(bytes: ByteArray, offset: Int, length: Int): Int {
-                lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-                resume()
-                return super.read(bytes, offset, length)
-            }
+        listen {
+            reader(scripted(
+                { pause(); resume(); denial().toByteArray() },
+                { denial().toByteArray() },
+            ))
         }
-        listen { reader(stream) }
         resume()
         runWorkers()
         assertEquals(1, launches)
@@ -148,12 +175,68 @@ class ClipboardListenerTest {
         assertNull(shadowOf(application).nextStartedActivity)
         assertEquals(1, destroyed)
 
-        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        pause()
         resume()
         runWorkers()
         assertEquals(2, launches)
         assertClipboardReadRequested()
         assertEquals(2, destroyed)
+    }
+
+    @Test
+    fun probeAnsweredByReaderIsNotTreatedAsACopy() {
+        listen {
+            reader(scripted(
+                { pause(); idle(); denial().toByteArray() },
+                { denial().toByteArray() },
+            ))
+        }
+        resume()
+        runWorkers()
+        // First denial answers the probe, second is a real clipboard change.
+        assertClipboardReadRequested()
+        assertNull(shadowOf(application).nextStartedActivity)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(3))
+        assertEquals(1, destroyed)
+    }
+
+    @Test
+    fun blindReaderIsStoppedAfterProbeTimeoutAndReplacedOnNextResume() {
+        listen {
+            if (launches == 1) reader(scripted({
+                pause()
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(2))
+                assertEquals("Blind reader should be destroyed by the probe timeout", 1, destroyed)
+                null
+            })) else reader()
+        }
+        resume()
+        runWorkers()
+        assertNull(shadowOf(application).nextStartedActivity)
+
+        resume()
+        runWorkers()
+        assertEquals(2, launches)
+        assertClipboardReadRequested()
+    }
+
+    @Test
+    fun unlockWithoutReaderRequestsLogAccessThroughInvisibleActivity() {
+        listen()
+        application.sendBroadcast(Intent(Intent.ACTION_USER_PRESENT))
+        idle()
+        val started = shadowOf(application).nextStartedActivity
+        assertEquals(ClipboardFloatingActivity::class.java.name, started?.component?.className)
+        assertTrue(started!!.getBooleanExtra(ClipboardFloatingActivity.KEY_REQUEST_LOG_ACCESS, false))
+    }
+
+    @Test
+    fun unlockWithRunningReaderDoesNothing() {
+        listen()
+        resume()
+        application.sendBroadcast(Intent(Intent.ACTION_USER_PRESENT))
+        idle()
+        assertNull(shadowOf(application).nextStartedActivity)
     }
 
     @Test
@@ -164,7 +247,7 @@ class ClipboardListenerTest {
         runWorkers()
         assertEquals(0, launches)
 
-        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        pause()
         shadowOf(application).grantPermissions(Manifest.permission.READ_LOGS)
         resume()
         runWorkers()
